@@ -520,26 +520,84 @@ def restore_protected(masked: str, chunks: list[ProtectedChunk]) -> str:
 
 
 def validate_masked(candidate: str, section: Section, exact: list[str]) -> list[str]:
+    """
+    Validate a rewritten masked section before protected source is restored.
+
+    Guarantees:
+    - every protected placeholder exists exactly once
+    - placeholders remain in original order
+    - placeholders are on their OWN LINE, so restoring a fenced block can never
+      produce garbage such as: "Install: ```powershell"
+    - no invented placeholders
+    - no compiler prompt delimiters leak into the output
+    - exact mutable literals survive
+    """
     errors = []
+
+    # Prompt-only delimiters must never become part of the compiled skill.
+    leaked = (
+        "--- section ---",
+        "--- end section ---",
+        "--- context ---",
+        "--- end context ---",
+    )
+    for marker in leaked:
+        if marker in candidate:
+            errors.append(f"compiler delimiter leaked into output: {marker!r}")
+
     positions = []
+
     for c in section.protected:
-        count = candidate.count(c.placeholder)
+        ph = c.placeholder
+
+        # Must exist exactly once.
+        count = candidate.count(ph)
         if count != 1:
-            errors.append(f"{c.placeholder} occurs {count} times")
-        else:
-            positions.append(candidate.index(c.placeholder))
+            errors.append(f"{ph} occurs {count} times")
+            continue
+
+        positions.append(candidate.index(ph))
+
+        # CRITICAL:
+        # placeholder must occupy a complete Markdown line.
+        #
+        # Good:
+        #
+        #   Install the validator:
+        #
+        #   [[PROTECTED_003]]
+        #
+        # Bad:
+        #
+        #   Install: [[PROTECTED_003]]
+        #
+        # because restoring a ```powershell block in the latter gives:
+        #
+        #   Install: ```powershell
+        #
+        standalone = re.search(
+            rf"(?m)^[ \t]*{re.escape(ph)}[ \t]*(?:\r?\n|$)",
+            candidate,
+        )
+        if standalone is None:
+            errors.append(f"{ph} is not on its own line")
+
+    # Protected chunks may not move relative to one another.
     if positions != sorted(positions):
         errors.append("protected placeholders reordered")
-    for x in exact:
-        if x not in candidate:
-            errors.append(f"missing exact literal {x!r}")
-    # No new placeholders.
+
+    # No new/invented placeholders.
     allowed = {c.placeholder for c in section.protected}
     for ph in PLACEHOLDER_RE.findall(candidate):
         if ph not in allowed:
             errors.append(f"invented placeholder {ph}")
-    return errors
 
+    # Exact mutable contract literals must survive.
+    for x in exact:
+        if x not in candidate:
+            errors.append(f"missing exact literal {x!r}")
+
+    return errors
 
 def parse_json_text(raw: str) -> str:
     obj = json_repair_loads(raw)
