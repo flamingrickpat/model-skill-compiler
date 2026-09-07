@@ -1,68 +1,23 @@
 #!/usr/bin/env python3
 """
-model-skill-compiler
+model-skill-compiler v0.3: section-budget compiler
 
-Progressively compress a Markdown coding-agent skill *for the exact model
-currently loaded in llama.cpp*.
+Compress Markdown coding-agent skills for the exact model loaded in llama.cpp.
 
-Core idea
----------
-The skill is compiled left-to-right. For each prose block:
-
-    generic coding-agent framing
-    + already-COMPILED prefix
-    -> teacher-force ORIGINAL current block one token at a time
-    -> measure what this model finds surprising
-    -> ask the SAME model to rewrite only the predictable redundancy
-    -> append the accepted rewrite
-    -> score the next block against that new compressed prefix
-
-This matters: later probabilities are conditioned on the text the production
-agent will actually see, not on an original prefix that was already deleted.
-
-Protected source
-----------------
-Version 1 NEVER rewrites:
-- YAML frontmatter
-- headings
-- fenced code
-- indented Markdown code blocks
-- raw HTML blocks
-- complete raw HTML documents/templates (<html> ... </html>)
-- Markdown tables
-- thematic/structural Markdown outside prose paragraphs
-
-Inline literals inside prose (backticks, paths, flags, numbers, etc.) are
-protected during rewrite.
-
-The output Markdown is written after every accepted block. The unprocessed
-remainder stays original, so even an interrupted run leaves a complete usable
-SKILL.compiled.md.
-
-Requires llama.cpp native server endpoints:
-  /props
-  /apply-template
-  /tokenize
-  /completion
-
-Scoring deliberately uses n_predict=1. Some llama.cpp builds return empty
-top_logprobs for multi-token generations with n_probs enabled.
-
-Install:
-    pip install -r requirements.txt
+Key differences from the earlier paragraph compiler:
+  * process whole H1/H2 sections, not individual paragraphs
+  * user supplies an explicit reduction target per section
+  * surprisal is a RELATIVE priority heatmap inside the section, not a KEEP gate
+  * fenced/indented code, raw HTML, tables, frontmatter, and headings are immutable
+  * sparse teacher-forced scoring (default: every 4th mutable token)
+  * compile left-to-right against the already-compiled prefix
+  * retry rewrites that exceed the section token budget
+  * compiler-owned Markdown block separators between sections
 
 Example:
-    python skill_compiler.py agents/skills/foo/SKILL.md \
-        --url http://127.0.0.1:8080
+  python skill_compiler_v3.py SKILL.md --url http://127.0.0.1:8080 --reduce-percent 50
 
-Useful:
-    --output foo.compiled.md
-    --top-n 128
-    --keep-p90 5
-    --keep-max 8
-    --resume
 """
-
 from __future__ import annotations
 
 import argparse
@@ -72,29 +27,19 @@ import math
 import os
 import re
 import statistics
-import sys
 import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
+import frontmatter
 import requests
+from blingfire import text_to_sentences
+from json_repair import loads as json_repair_loads
+from markdown_it import MarkdownIt
+from mdit_py_plugins.front_matter import front_matter_plugin
 from rich.console import Console
 from rich.table import Table
-
-try:
-    import frontmatter
-    from blingfire import text_to_sentences_and_offsets
-    from json_repair import loads as json_repair_loads
-    from markdown_it import MarkdownIt
-    from mdit_py_plugins.front_matter import front_matter_plugin
-    import yake
-except ImportError as e:
-    missing = getattr(e, "name", str(e))
-    raise SystemExit(
-        f"Missing dependency: {missing}\n"
-        "Run: pip install -r requirements.txt"
-    )
 
 console = Console()
 LN2 = math.log(2)
@@ -114,98 +59,83 @@ The following is the skill definition for this role. Treat it as the authoritati
 <skill>
 """
 
-REWRITE_SYSTEM = """You compile one prose block from an operational coding-agent skill into a shorter representation for the SAME language model that will later read it.
+REWRITE_SYSTEM = """You are compiling one SECTION of an operational coding-agent skill into a much shorter representation for the SAME language model that will later read it.
 
-This is model-specific instruction compression, not ordinary summarization.
+This is lossy model-specific instruction compression, not prose editing.
+
+You receive a HARD mutable-prose token budget. Spend those tokens on information the target model is least likely to infer by itself.
+
+Priority order:
+1. project-specific invariants, prohibitions, exact workflow semantics, ordering, scope/ownership, failure behavior
+2. exact identifiers, paths, commands, status values, quantities, thresholds, tool semantics
+3. information marked high relative surprisal for this model
+4. only then generic explanation/rationale
 
 Rules:
-- Preserve every project-specific behavior, invariant, prohibition, condition, ordering relation, scope boundary, failure rule, exact quantity, status, identifier, path, command, and tool semantic.
-- Preserve negation and modality. "must", "must not", "only", "before", "after", "unless", "exactly", etc. can carry more information than nouns.
-- EXACT spans supplied by the caller must appear byte-for-byte in the result.
-- HIGH-SURPRISE spans are strong evidence of model-novel information. Preserve their operational meaning; prefer their original wording when already terse.
-- Low-surprise generic coding advice may be shortened to a tiny semantic cue or removed when the surrounding role already implies it.
-- Do not turn relational rules into noun-only keyword soup. "commit evidence artifact" is not equivalent to "never commit before the evidence artifact exists".
-- Remove rationale/examples only when they are not necessary to disambiguate or generalize a rule.
-- Do not add requirements, exceptions, defaults, commands, tools, or facts.
-- Preserve the Markdown role of the block (paragraph/list item/blockquote). Do not emit code fences.
-- If the entire block is safely implicit in ordinary coding-agent competence and carries no contextual cue needed by later instructions, it may become empty.
-- Prefer terse operational language.
+- Achieve the requested budget. Do not preserve prose style for its own sake.
+- Merge duplicate rules inside the section.
+- Generic competent-coder advice should usually disappear.
+- Preserve negation, conditions, ordering, exceptions, and modality when they change behavior.
+- Protected placeholders like [[PROTECTED_003]] must appear EXACTLY ONCE, unchanged, and in the same order. They stand for code/HTML/tables/headings copied byte-for-byte later.
+- EXACT literals supplied by the caller must survive byte-for-byte if they occur in mutable prose.
+- Do not invent facts, commands, defaults, tools, or requirements.
+- Dense Markdown is desirable: terse clauses, semicolons, compact bullets.
+- Do not wrap output in a code fence.
 
 Return JSON only:
-{"text":"<rewritten markdown block, or empty string>"}
+{"text":"<compiled masked Markdown section>"}
 """
 
-# Strong semantic operators. We do not force these exact words to survive, but
-# their presence makes a sentence less safe to drop.
-OPERATOR_RE = re.compile(
-    r"\b(?:"
-    r"must(?:\s+not)?|never|always|only|exactly|forbid(?:den)?|"
-    r"before|after|until|unless|if|when|otherwise|except|without|"
-    r"first|last|required|shall|may\s+not|cannot|can't|do\s+not|no"
-    r")\b",
-    re.IGNORECASE,
-)
+TIGHTEN_SYSTEM = """Shorten the supplied compiled Markdown section to fit its hard mutable-prose token budget without losing its operational contract.
 
-# Things whose exact spelling commonly *is* the contract.
+Never alter/remove/reorder [[PROTECTED_NNN]] placeholders. Preserve all supplied EXACT literals byte-for-byte. Delete explanation and redundancy before deleting rules. Merge repeated rules. Use terse clauses and compact bullets. Do not invent anything.
+
+Return JSON only:
+{"text":"<shorter masked Markdown section>"}
+"""
+
 INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 FLAG_RE = re.compile(r"(?<!\w)--?[A-Za-z][A-Za-z0-9_-]*(?:=[^\s,;]+)?")
 URL_RE = re.compile(r"https?://[^\s)>]+")
 PATH_RE = re.compile(
-    r"(?<!\w)(?:"
-    r"[A-Za-z]:[\\/][^\s`\"']+|"
-    r"(?:\.{0,2}[\\/])(?:[\w.\-]+[\\/])+[\w.\-]+|"
-    r"(?:[\w.\-]+[\\/]){2,}[\w.\-]+|"
-    r"[\w.\-]+\.(?:md|json|ya?ml|toml|ini|cfg|py|js|ts|tsx|jsx|cs|cpp|c|h|"
-    r"html|css|xml|sql|sh|ps1|bat|cmd)"
-    r")"
+    r"(?<!\w)(?:[A-Za-z]:[\\/][^\s`\"']+|(?:\.{0,2}[\\/])(?:[\w.\-]+[\\/])+[\w.\-]+|"
+    r"(?:[\w.\-]+[\\/]){2,}[\w.\-]+|[\w.\-]+\.(?:md|json|ya?ml|toml|ini|cfg|py|js|ts|tsx|jsx|cs|cpp|c|h|html|css|xml|sql|sh|ps1|bat|cmd))"
 )
-NUMBER_RE = re.compile(
-    r"(?<![\w.])"
-    r"(?:\d+(?:\.\d+)?(?:%|ms|s|min|h|k|m|gb|mb|kb|tokens?)?"
-    r"|0x[0-9A-Fa-f]+)"
-    r"(?![\w.])",
-    re.IGNORECASE,
-)
-COMPARATOR_RE = re.compile(r"(?:<=|>=|==|!=|<|>)")
+NUMBER_RE = re.compile(r"(?<![\w.])(?:\d+(?:\.\d+)?(?:%|ms|s|min|h|k|m|gb|mb|kb|tokens?)?|0x[0-9A-Fa-f]+)(?![\w.])", re.I)
+PLACEHOLDER_RE = re.compile(r"\[\[PROTECTED_\d{3}\]\]")
 
 
 @dataclass
-class Segment:
+class ProtectedChunk:
+    placeholder: str
+    start_line: int
+    end_line: int
+    text: str
+
+
+@dataclass
+class Section:
     index: int
-    kind: str                 # prose | protected
-    reason: str
-    start_line: int           # 0-based inclusive
-    end_line: int             # 0-based exclusive
-    text: str
+    start_line: int
+    end_line: int
+    title: str
+    raw: str
+    masked: str
+    protected: list[ProtectedChunk]
+    protected_line_ranges: list[tuple[int, int]]
 
 
 @dataclass
-class TokenScore:
-    token_id: int
-    text: str
+class Sample:
+    token_index: int
     start_byte: int
     end_byte: int
-    rank: int | None
-    logprob: float | None
-    surprisal_bits: float
-    regret_bits: float
-    censored: bool
-
-
-@dataclass
-class SentenceSignal:
     text: str
-    start: int
-    end: int
-    label: str
-    mean_regret: float
-    p90_regret: float
-    max_regret: float
-    top1_fraction: float
-    high_fraction: float
-    has_operator: bool
-    exact_spans: list[str]
-    high_surprise_spans: list[str]
+    regret_bits: float
+    surprisal_bits: float
+    rank: int | None
+    censored: bool
+    percentile: float = 0.0
 
 
 class Llama:
@@ -229,43 +159,26 @@ class Llama:
     def post(self, path: str, data: dict[str, Any]) -> dict[str, Any]:
         r = self.http.post(self.url + path, json=data, timeout=self.timeout)
         if not r.ok:
-            raise RuntimeError(
-                f"{path}: HTTP {r.status_code}\n{r.text[:4000]}"
-            )
+            raise RuntimeError(f"{path}: HTTP {r.status_code}\n{r.text[:5000]}")
         return r.json()
 
     def apply_template(self, messages: list[dict[str, str]]) -> str:
-        r = self.post("/apply-template", {
+        return self.post("/apply-template", {
             "messages": messages,
             "chat_template_kwargs": {"enable_thinking": False},
             "reasoning_format": "none",
-        })
-        return r["prompt"]
+        })["prompt"]
 
-    def tokenize(
-        self,
-        text: str,
-        *,
-        add_special: bool = True,
-        pieces: bool = False,
-    ) -> list[Any]:
-        r = self.post("/tokenize", {
+    def tokenize(self, text: str, *, add_special: bool = False, pieces: bool = False):
+        return self.post("/tokenize", {
             "content": text,
             "add_special": add_special,
             "parse_special": True,
             "with_pieces": pieces,
-        })
-        return r["tokens"]
+        })["tokens"]
 
-    def completion_one(
-        self,
-        prompt_ids: list[int],
-        *,
-        top_n: int,
-        cache_prompt: bool = True,
-    ) -> dict[str, Any]:
-        # n_predict=1 is intentional. See module docstring.
-        return self.post("/completion", {
+    def score_one(self, prompt_ids: list[int], *, top_n: int, cache_prompt: bool) -> dict[str, Any]:
+        r = self.post("/completion", {
             "prompt": prompt_ids,
             "n_predict": 1,
             "n_probs": top_n,
@@ -282,56 +195,42 @@ class Llama:
             "frequency_penalty": 0.0,
             "dry_multiplier": 0.0,
         })
+        probs = r.get("completion_probabilities") or []
+        if not probs:
+            raise RuntimeError("llama.cpp returned no completion_probabilities")
+        return probs[0]
 
-    def generate_chat(
-        self,
-        system: str,
-        user: str,
-        *,
-        max_tokens: int,
-        slot: int | None = None,
-    ) -> str:
+    def generate(self, system: str, user: str, *, max_tokens: int, slot: int | None = None) -> str:
         prompt = self.apply_template([
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ])
-        payload: dict[str, Any] = {
+        r = self.post("/completion", {
             "prompt": prompt,
             "n_predict": max_tokens,
             "temperature": 0.0,
             "stream": False,
             "cache_prompt": False,
+            "id_slot": self.slot if slot is None else slot,
             "seed": 1,
             "repeat_penalty": 1.0,
             "presence_penalty": 0.0,
             "frequency_penalty": 0.0,
             "dry_multiplier": 0.0,
-        }
-        payload["id_slot"] = self.slot if slot is None else slot
-        r = self.post("/completion", payload)
+        })
         return r.get("content", "")
 
 
-def piece_bytes(token: Any) -> bytes:
-    p = token["piece"]
+def piece_bytes(tok: Any) -> bytes:
+    p = tok["piece"]
     return p.encode("utf-8") if isinstance(p, str) else bytes(p)
 
 
-def percentile(xs: list[float], q: float) -> float:
-    if not xs:
-        return 0.0
-    ys = sorted(xs)
-    pos = (len(ys) - 1) * q
-    lo, hi = math.floor(pos), math.ceil(pos)
-    if lo == hi:
-        return ys[lo]
-    return ys[lo] * (hi - pos) + ys[hi] * (pos - lo)
-
-
-def merge_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
-    ranges = sorted((a, b) for a, b in ranges if b > a)
+def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     out: list[list[int]] = []
-    for a, b in ranges:
+    for a, b in sorted(ranges):
+        if b <= a:
+            continue
         if not out or a > out[-1][1]:
             out.append([a, b])
         else:
@@ -339,15 +238,7 @@ def merge_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     return [(a, b) for a, b in out]
 
 
-def is_in_ranges(line: int, ranges: list[tuple[int, int]]) -> bool:
-    return any(a <= line < b for a, b in ranges)
-
-
 def standalone_html_ranges(lines: list[str]) -> list[tuple[int, int]]:
-    """
-    CommonMark intentionally splits a large HTML document at some blank lines.
-    For skill templates, preserve a complete <html>...</html> source region.
-    """
     out = []
     i = 0
     while i < len(lines):
@@ -362,7 +253,6 @@ def standalone_html_ranges(lines: list[str]) -> list[tuple[int, int]]:
                     break
                 j += 1
             else:
-                # Unclosed raw HTML: preserve to EOF rather than touching it.
                 out.append((start, len(lines)))
                 return out
         else:
@@ -370,646 +260,451 @@ def standalone_html_ranges(lines: list[str]) -> list[tuple[int, int]]:
     return out
 
 
-def markdown_segments(text: str) -> list[Segment]:
-    """
-    Use markdown-it-py for actual Markdown structure. Custom code is limited to
-    mapping exact source line ranges and protecting complete raw HTML documents.
-    """
+def parse_sections(text: str, section_level: int = 2) -> list[Section]:
     lines = text.splitlines(keepends=True)
-
     md = MarkdownIt("commonmark", {"html": True}).enable("table")
     md.use(front_matter_plugin)
     tokens = md.parse(text)
 
-    protected: list[tuple[int, int]] = []
-    prose: list[tuple[int, int]] = []
+    protected_ranges: list[tuple[int, int]] = []
+    heading_starts: list[tuple[int, int, str]] = []
 
-    for tok in tokens:
+    for i, tok in enumerate(tokens):
         if not tok.map:
             continue
         a, b = tok.map
+        if tok.type in {"front_matter", "fence", "code_block", "html_block", "table_open", "hr"}:
+            protected_ranges.append((a, b))
+        if tok.type == "heading_open":
+            protected_ranges.append((a, b))
+            level = int(tok.tag[1:]) if tok.tag.startswith("h") else 9
+            # inline token follows heading_open in markdown-it
+            title = ""
+            if i + 1 < len(tokens) and tokens[i + 1].type == "inline":
+                title = tokens[i + 1].content
+            if level <= section_level:
+                heading_starts.append((a, level, title))
 
-        if tok.type in {
-            "front_matter",
-            "fence",
-            "code_block",
-            "html_block",
-            "table_open",
-            "heading_open",      # structural/navigation cue: keep v1 exact
-            "hr",
-        }:
-            protected.append((a, b))
+    protected_ranges.extend(standalone_html_ranges(lines))
+    protected_ranges = merge_ranges(protected_ranges)
 
-        if tok.type == "paragraph_open":
-            prose.append((a, b))
+    boundaries = sorted({0, len(lines), *[a for a, _level, _title in heading_starts]})
+    title_by_start = {a: title for a, _level, title in heading_starts}
 
-    protected.extend(standalone_html_ranges(lines))
-    protected = merge_ranges(protected)
+    sections: list[Section] = []
+    for si, (a, b) in enumerate(zip(boundaries, boundaries[1:])):
+        if b <= a:
+            continue
+        raw = "".join(lines[a:b])
+        local_protected = []
+        for p0, p1 in protected_ranges:
+            x0, x1 = max(a, p0), min(b, p1)
+            if x1 > x0:
+                local_protected.append((x0, x1))
+        local_protected = merge_ranges(local_protected)
 
-    # Remove prose ranges that overlap anything protected.
-    prose = [
-        (a, b) for a, b in prose
-        if not any(max(a, p0) < min(b, p1) for p0, p1 in protected)
-    ]
+        chunks: list[ProtectedChunk] = []
+        cursor = a
+        masked_parts: list[str] = []
+        for n, (p0, p1) in enumerate(local_protected):
+            masked_parts.append("".join(lines[cursor:p0]))
+            ph = f"[[PROTECTED_{n:03d}]]"
+            exact = "".join(lines[p0:p1])
+            chunks.append(ProtectedChunk(ph, p0, p1, exact))
+            # Put placeholder on its own line; restored bytes are exact later.
+            masked_parts.append("\n" + ph + "\n")
+            cursor = p1
+        masked_parts.append("".join(lines[cursor:b]))
+        masked = "".join(masked_parts)
 
-    # Paragraph maps can theoretically overlap under plugins. Keep only unique,
-    # non-overlapping leaf ranges.
-    prose = merge_ranges(prose)
-
-    # Every source line belongs to either a selected prose paragraph or an exact
-    # passthrough region/gap. This guarantees source order and lossless handling
-    # of syntax we did not explicitly classify.
-    marks: list[str | None] = [None] * len(lines)
-
-    for a, b in protected:
-        for i in range(a, min(b, len(lines))):
-            marks[i] = "protected"
-
-    for a, b in prose:
-        for i in range(a, min(b, len(lines))):
-            if marks[i] is None:
-                marks[i] = "prose"
-
-    # Gaps, blank lines, list/container syntax, and anything unknown are exact
-    # passthrough. This is deliberately conservative.
-    for i in range(len(marks)):
-        if marks[i] is None:
-            marks[i] = "protected"
-
-    segments: list[Segment] = []
-    i = 0
-    while i < len(lines):
-        kind = marks[i]
-        j = i + 1
-        while j < len(lines) and marks[j] == kind:
-            # Do not merge separate prose paragraphs across blank structural
-            # passthrough: paragraph maps already stop before those lines.
-            if kind == "prose":
-                # A continuous prose map is okay, but stop when line j belongs
-                # to a different original paragraph range.
-                owner_i = next(((a, b) for a, b in prose if a <= i < b), None)
-                if owner_i and not (owner_i[0] <= j < owner_i[1]):
-                    break
-            j += 1
-
-        reason = "markdown prose paragraph" if kind == "prose" else "protected/structural markdown"
-        segments.append(Segment(
-            index=len(segments),
-            kind=kind or "protected",
-            reason=reason,
-            start_line=i,
-            end_line=j,
-            text="".join(lines[i:j]),
+        sections.append(Section(
+            index=len(sections),
+            start_line=a,
+            end_line=b,
+            title=title_by_start.get(a, "(preamble)"),
+            raw=raw,
+            masked=masked,
+            protected=chunks,
+            protected_line_ranges=local_protected,
         ))
-        i = j
-
-    return segments
+    return sections
 
 
-def find_exact_spans(text: str) -> list[str]:
-    spans: list[str] = []
-    for rx in (INLINE_CODE_RE, FLAG_RE, URL_RE, PATH_RE, NUMBER_RE, COMPARATOR_RE):
-        for m in rx.finditer(text):
-            s = m.group(0)
-            if s and s not in spans:
-                spans.append(s)
-    return spans
-
-
-def build_skill_prompt_prefix(
-    llm: Llama,
-    *,
-    system_prompt: str,
-    skill_name: str,
-) -> str:
-    """
-    Render a chat template whose user message is intentionally left open at the
-    skill body. This scores the skill as *input instructions*, not as assistant
-    prose the model was asked to author.
-
-    We place a sentinel inside the user content, apply the model's exact chat
-    template, then cut the rendered prompt immediately before the sentinel.
-    """
+def build_skill_prompt_prefix(llm: Llama, system_prompt: str, skill_name: str) -> str:
     sentinel = "__MODEL_SKILL_COMPILER_BODY_9f6c1c4a__"
-    user_prefix = SKILL_USER_PREFIX.format(skill_name=skill_name)
-
-    for n_newlines in range(0, 5):
-        user = user_prefix + ("\n" * n_newlines) + sentinel
-        rendered = llm.apply_template([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user},
-        ])
-        if sentinel in rendered:
-            before, after = rendered.split(sentinel, 1)
-            if sentinel not in after:
-                return before
-
-    raise RuntimeError(
-        "The chat template transformed/removed the skill sentinel. "
-        "Cannot safely build an open user-message prefix."
-    )
+    user = SKILL_USER_PREFIX.format(skill_name=skill_name) + sentinel
+    rendered = llm.apply_template([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user},
+    ])
+    if sentinel not in rendered:
+        raise RuntimeError("chat template transformed/removed skill sentinel")
+    return rendered.split(sentinel, 1)[0]
 
 
-def tokenize_for_continuation(
-    llm: Llama,
-    context: str,
-    continuation: str,
-) -> tuple[list[int], list[int], list[bytes], int]:
-    """
-    Tokenize exact context+continuation once.
-
-    If a BPE token straddles the text boundary, include that token in the prefix
-    and skip scoring only that boundary token. Subsequent token probabilities
-    remain exact for the true final byte stream.
-    """
-    # /apply-template already rendered the model's special tokens. Re-adding
-    # tokenizer BOS/EOS here would corrupt source-byte offset accounting.
+def tokenize_continuation(llm: Llama, context: str, continuation: str):
     full = llm.tokenize(context + continuation, add_special=False, pieces=True)
     ids = [int(x["id"]) for x in full]
     pieces = [piece_bytes(x) for x in full]
-
     boundary = len(context.encode("utf-8"))
-    offset = 0
-    start_idx = None
-    skipped_boundary_bytes = 0
-
-    for i, b in enumerate(pieces):
-        token_start = offset
-        token_end = offset + len(b)
-        if token_start >= boundary:
-            start_idx = i
+    off = 0
+    start = len(ids)
+    skipped = 0
+    for i, pb in enumerate(pieces):
+        a, b = off, off + len(pb)
+        if a >= boundary:
+            start = i
             break
-        if token_start < boundary < token_end:
-            # This token contains bytes from both sides. Treat it as context.
-            skipped_boundary_bytes = token_end - boundary
-        offset = token_end
-
-    if start_idx is None:
-        start_idx = len(ids)
-
-    prefix_ids = ids[:start_idx]
-    target_ids = ids[start_idx:]
-    target_pieces = pieces[start_idx:]
-    return prefix_ids, target_ids, target_pieces, skipped_boundary_bytes
+        if a < boundary < b:
+            skipped = b - boundary
+        off = b
+    return ids[:start], ids[start:], pieces[start:], skipped
 
 
-def score_distribution(target_id: int, item: dict[str, Any]) -> dict[str, Any]:
+def line_ranges_to_byte_ranges(section: Section) -> list[tuple[int, int]]:
+    lines = section.raw.splitlines(keepends=True)
+    prefix = [0]
+    for line in lines:
+        prefix.append(prefix[-1] + len(line.encode("utf-8")))
+    out = []
+    for a_abs, b_abs in section.protected_line_ranges:
+        a = max(0, a_abs - section.start_line)
+        b = max(0, b_abs - section.start_line)
+        a = min(a, len(lines)); b = min(b, len(lines))
+        out.append((prefix[a], prefix[b]))
+    return merge_ranges(out)
+
+
+def inside_ranges(a: int, b: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(max(a, x0) < min(b, x1) for x0, x1 in ranges)
+
+
+def distribution_score(target: int, item: dict[str, Any]):
     top = item.get("top_logprobs") or []
-    generated_id = int(item["id"])
-    generated_lp = item.get("logprob")
-
+    generated = int(item["id"])
     if not top:
-        if generated_id == target_id and generated_lp is not None:
-            lp = float(generated_lp)
-            return {
-                "rank": 1,
-                "logprob": lp,
-                "surprisal_bits": max(0.0, -lp / LN2),
-                "regret_bits": 0.0,
-                "censored": False,
-            }
-        raise RuntimeError(
-            "llama.cpp returned empty top_logprobs on a mismatch. "
-            "Use n_predict=1 (this script does) and verify your build's n_probs support."
-        )
-
+        lp = item.get("logprob")
+        if generated == target and lp is not None:
+            lp = float(lp)
+            return 1, lp, max(0.0, -lp / LN2), 0.0, False
+        raise RuntimeError("empty top_logprobs on mismatch")
     top = sorted(top, key=lambda x: x["logprob"], reverse=True)
     top1 = float(top[0]["logprob"])
-
     for rank, x in enumerate(top, 1):
-        if int(x["id"]) == target_id:
+        if int(x["id"]) == target:
             lp = float(x["logprob"])
-            return {
-                "rank": rank,
-                "logprob": lp,
-                "surprisal_bits": max(0.0, -lp / LN2),
-                "regret_bits": max(0.0, (top1 - lp) / LN2),
-                "censored": False,
-            }
-
+            return rank, lp, max(0.0, -lp / LN2), max(0.0, (top1 - lp) / LN2), False
     cutoff = float(top[-1]["logprob"])
-    return {
-        "rank": None,
-        "logprob": None,
-        "surprisal_bits": max(0.0, -cutoff / LN2),
-        "regret_bits": max(0.0, (top1 - cutoff) / LN2),
-        "censored": True,
-    }
+    return None, None, max(0.0, -cutoff / LN2), max(0.0, (top1 - cutoff) / LN2), True
 
 
-def score_block(
+def sparse_score_section(
     llm: Llama,
-    *,
     context: str,
-    block: str,
+    section: Section,
+    *,
     top_n: int,
+    stride: int,
     cache_prompt: bool,
-) -> tuple[list[TokenScore], int]:
-    prefix_ids, ids, pieces, skipped_boundary_bytes = tokenize_for_continuation(
-        llm, context, block
-    )
+) -> list[Sample]:
+    prefix_ids, ids, pieces, skipped = tokenize_continuation(llm, context, section.raw)
+    protected_bytes = line_ranges_to_byte_ranges(section)
 
-    # Map target token bytes back to byte offsets inside this block.
-    # skipped_boundary_bytes means the first few block bytes were swallowed by
-    # a BPE token that straddled the context boundary and are intentionally
-    # unscored.
-    block_offset = skipped_boundary_bytes
-    scores: list[TokenScore] = []
+    offsets = []
+    off = skipped
+    mutable_ord = 0
+    sample_indices = []
+    for i, pb in enumerate(pieces):
+        a, b = off, off + len(pb)
+        offsets.append((a, b))
+        if not inside_ranges(a, b, protected_bytes):
+            if mutable_ord % stride == 0:
+                sample_indices.append(i)
+            mutable_ord += 1
+        off = b
 
-    for i, (target, piece) in enumerate(zip(ids, pieces)):
-        r = llm.completion_one(
-            prefix_ids + ids[:i],
-            top_n=top_n,
-            cache_prompt=cache_prompt,
-        )
-        probs = r.get("completion_probabilities") or []
-        if not probs:
-            raise RuntimeError(
-                "llama.cpp returned no completion_probabilities.\n"
-                f"generation_settings={json.dumps(r.get('generation_settings', {}), indent=2)}"
-            )
-
-        item = probs[0]
-        d = score_distribution(target, item)
-
-        start = block_offset
-        end = start + len(piece)
-        scores.append(TokenScore(
-            token_id=target,
-            text=piece.decode("utf-8", "replace"),
-            start_byte=start,
-            end_byte=end,
-            rank=d["rank"],
-            logprob=d["logprob"],
-            surprisal_bits=d["surprisal_bits"],
-            regret_bits=d["regret_bits"],
-            censored=d["censored"],
+    samples = []
+    for n, i in enumerate(sample_indices, 1):
+        item = llm.score_one(prefix_ids + ids[:i], top_n=top_n, cache_prompt=cache_prompt)
+        rank, lp, surprise, regret, censored = distribution_score(ids[i], item)
+        a, b = offsets[i]
+        samples.append(Sample(
+            token_index=i,
+            start_byte=a,
+            end_byte=b,
+            text=pieces[i].decode("utf-8", "replace"),
+            regret_bits=regret,
+            surprisal_bits=surprise,
+            rank=rank,
+            censored=censored,
         ))
-        block_offset = end
 
-    return scores, skipped_boundary_bytes
+    # Relative percentile is the useful signal; absolute regret is model/framing dependent.
+    vals = sorted(s.regret_bits for s in samples)
+    for s in samples:
+        if len(vals) <= 1:
+            s.percentile = 1.0
+        else:
+            # rightmost rank among equal values
+            rank = max(i for i, v in enumerate(vals) if v <= s.regret_bits)
+            s.percentile = rank / (len(vals) - 1)
+    return samples
 
 
-def char_to_byte_offsets(text: str) -> list[int]:
-    out = [0]
-    n = 0
-    for ch in text:
-        n += len(ch.encode("utf-8"))
-        out.append(n)
+def exact_spans(text: str) -> list[str]:
+    out = []
+    # Inline code is the most important exact class. Other exacts are retained too,
+    # but avoid protecting bare common integers inside placeholders.
+    for rx in (INLINE_CODE_RE, FLAG_RE, URL_RE, PATH_RE, NUMBER_RE):
+        for m in rx.finditer(text):
+            s = m.group(0)
+            if PLACEHOLDER_RE.fullmatch(s):
+                continue
+            if s not in out:
+                out.append(s)
     return out
 
 
-def sentence_ranges(text: str) -> list[tuple[str, int, int]]:
-    """
-    BlingFire returns:
-        (newline-delimited sentence string, [(start, end), ...])
-
-    We use BlingFire for segmentation, then locate each returned sentence
-    sequentially in the original Python string. That avoids depending on whether
-    a particular BlingFire build exposes byte or character offsets for Unicode,
-    while still using its sentence boundary decisions.
-    """
-    try:
-        sentence_blob, _offsets = text_to_sentences_and_offsets(text)
-        sentences = [s for s in sentence_blob.split("\\n") if s]
-    except Exception:
-        sentences = []
-
-    out: list[tuple[str, int, int]] = []
-    cursor = 0
-
-    for sent in sentences:
-        # BlingFire removes separator newlines from its output but otherwise
-        # normally preserves sentence text. Search forward so repeated sentences
-        # resolve to the correct occurrence.
-        a = text.find(sent, cursor)
-        if a < 0:
-            # Whitespace-normalizing fallback for unusual Markdown wrapping:
-            # don't invent fragile offset math; keep the whole block instead.
-            return [(text, 0, len(text))] if text else []
-        b = a + len(sent)
-        out.append((text[a:b], a, b))
-        cursor = b
-
-    if not out and text:
-        out = [(text, 0, len(text))]
-    return out
+def mutable_text(masked: str) -> str:
+    return PLACEHOLDER_RE.sub("", masked)
 
 
-def expand_byte_span_to_words(text: str, start_b: int, end_b: int) -> str:
-    raw = text.encode("utf-8")
-    start_b = max(0, min(start_b, len(raw)))
-    end_b = max(start_b, min(end_b, len(raw)))
+def token_count(llm: Llama, text: str) -> int:
+    return len(llm.tokenize(text, add_special=False, pieces=False))
 
-    # Move outward over ASCII-ish word/token punctuation. Decode only after
-    # locating UTF-8-safe boundaries.
-    while start_b > 0 and raw[start_b - 1:start_b] not in b" \t\r\n,;()[]{}":
-        start_b -= 1
-    while end_b < len(raw) and raw[end_b:end_b + 1] not in b" \t\r\n,;()[]{}":
-        end_b += 1
 
-    # UTF-8 boundary repair.
-    while start_b < len(raw):
+def snippet_around(raw: str, sample: Sample, radius: int = 55) -> str:
+    b = raw.encode("utf-8")
+    a = max(0, sample.start_byte - radius)
+    z = min(len(b), sample.end_byte + radius)
+    # repair UTF-8 boundaries
+    while a < sample.start_byte:
         try:
-            raw[start_b:end_b].decode("utf-8")
+            part = b[a:z].decode("utf-8")
             break
         except UnicodeDecodeError:
-            start_b += 1
-    while end_b > start_b:
-        try:
-            return raw[start_b:end_b].decode("utf-8").strip()
-        except UnicodeDecodeError:
-            end_b -= 1
-    return ""
+            a += 1
+    else:
+        part = sample.text
+    part = re.sub(r"\s+", " ", part).strip()
+    return part[:220]
 
 
-def high_surprise_spans(
-    text: str,
-    scores: list[TokenScore],
-    *,
-    threshold: float,
-    bridge_bytes: int = 3,
-) -> list[str]:
-    hits = [
-        (s.start_byte, s.end_byte)
-        for s in scores
-        if s.regret_bits >= threshold or s.censored
-    ]
-    if not hits:
-        return []
-
-    merged: list[list[int]] = []
-    for a, b in hits:
-        if not merged or a - merged[-1][1] > bridge_bytes:
-            merged.append([a, b])
-        else:
-            merged[-1][1] = max(merged[-1][1], b)
-
+def priority_excerpts(section: Section, samples: list[Sample], limit: int = 18):
+    ranked = sorted(samples, key=lambda s: (s.percentile, s.regret_bits), reverse=True)
     out = []
-    for a, b in merged:
-        s = expand_byte_span_to_words(text, a, b)
-        if s and s not in out:
-            out.append(s)
-    return out
-
-
-def classify_sentences(
-    text: str,
-    scores: list[TokenScore],
-    *,
-    keep_p90: float,
-    keep_max: float,
-    keep_fraction_threshold: float,
-    high_token_threshold: float,
-    drop_p90: float,
-) -> list[SentenceSignal]:
-    c2b = char_to_byte_offsets(text)
-    exact_all = find_exact_spans(text)
-    surprising_all = high_surprise_spans(
-        text, scores, threshold=high_token_threshold
-    )
-
-    signals: list[SentenceSignal] = []
-    for sent, ca, cb in sentence_ranges(text):
-        ba, bb = c2b[ca], c2b[cb]
-        ts = [
-            s for s in scores
-            if s.end_byte > ba and s.start_byte < bb
-        ]
-        if not ts:
-            # Boundary-token skip or odd markup. Be conservative.
-            signals.append(SentenceSignal(
-                text=sent,
-                start=ca,
-                end=cb,
-                label="KEEP",
-                mean_regret=0.0,
-                p90_regret=0.0,
-                max_regret=0.0,
-                top1_fraction=0.0,
-                high_fraction=0.0,
-                has_operator=bool(OPERATOR_RE.search(sent)),
-                exact_spans=[x for x in exact_all if x in sent],
-                high_surprise_spans=[],
-            ))
+    seen = set()
+    for s in ranked:
+        if s.percentile < 0.70:
+            break
+        snip = snippet_around(section.raw, s)
+        key = snip.lower()
+        if not snip or key in seen:
             continue
-
-        regrets = [x.regret_bits for x in ts]
-        p90 = percentile(regrets, 0.90)
-        mx = max(regrets)
-        high_fraction = sum(x >= high_token_threshold for x in regrets) / len(regrets)
-        top1_fraction = sum(x.rank == 1 for x in ts) / len(ts)
-        exact = [x for x in exact_all if x in sent]
-        surprising = [x for x in surprising_all if x and x in sent]
-        has_op = bool(OPERATOR_RE.search(sent))
-
-        keep = (
-            bool(exact)
-            or mx >= keep_max
-            or p90 >= keep_p90
-            or high_fraction >= keep_fraction_threshold
-        )
-
-        # Semantic operators alone should stop outright deletion, but ordinary
-        # sentences containing "before/if" can still be condensed.
-        if keep:
-            label = "KEEP"
-        elif p90 < drop_p90 and not has_op:
-            label = "DROP_CANDIDATE"
-        else:
-            label = "CONDENSE"
-
-        signals.append(SentenceSignal(
-            text=sent,
-            start=ca,
-            end=cb,
-            label=label,
-            mean_regret=statistics.fmean(regrets),
-            p90_regret=p90,
-            max_regret=mx,
-            top1_fraction=top1_fraction,
-            high_fraction=high_fraction,
-            has_operator=has_op,
-            exact_spans=exact,
-            high_surprise_spans=surprising,
-        ))
-
-    return signals
-
-
-def yake_keywords(text: str, language: str, top: int = 10) -> list[str]:
-    try:
-        extractor = yake.KeywordExtractor(
-            lan=language,
-            n=3,
-            dedupLim=0.82,
-            top=top,
-            features=None,
-        )
-        return [kw for kw, _score in extractor.extract_keywords(text)]
-    except Exception:
-        return []
-
-
-def markdown_shape_hint(block: str) -> str:
-    first = block.splitlines()[0] if block.splitlines() else ""
-    if re.match(r"^\s*[-+*]\s+", first):
-        return "bullet-list item; preserve its bullet marker"
-    if re.match(r"^\s*\d+[.)]\s+", first):
-        return "numbered-list item; preserve its numbering marker"
-    if re.match(r"^\s*>\s?", first):
-        return "blockquote paragraph; preserve blockquote marker"
-    return "plain Markdown paragraph"
-
-
-def collect_exact_spans(signals: list[SentenceSignal]) -> list[str]:
-    out = []
-    for s in signals:
-        for x in s.exact_spans:
-            if x not in out:
-                out.append(x)
-    return out
-
-
-def collect_high_spans(signals: list[SentenceSignal]) -> list[str]:
-    out = []
-    for s in signals:
-        for x in s.high_surprise_spans:
-            if x not in out:
-                out.append(x)
-    return out
-
-
-def rewrite_prompt(
-    *,
-    block: str,
-    signals: list[SentenceSignal],
-    prior_context: str,
-    keywords: list[str],
-) -> str:
-    compact_signals = []
-    for s in signals:
-        compact_signals.append({
-            "label": s.label,
-            "text": s.text,
-            "p90_regret_bits": round(s.p90_regret, 2),
-            "max_regret_bits": round(s.max_regret, 2),
-            "top1_fraction": round(s.top1_fraction, 2),
-            "operator": s.has_operator,
+        seen.add(key)
+        out.append({
+            "priority_percentile": round(s.percentile * 100),
+            "regret_bits": round(s.regret_bits, 2),
+            "excerpt": snip,
         })
-
-    exact = collect_exact_spans(signals)
-    high = collect_high_spans(signals)
-
-    return f"""Markdown shape: {markdown_shape_hint(block)}
-
-Immediately preceding COMPILED context (may be truncated):
---- context ---
-{prior_context}
---- end context ---
-
-Original block:
---- original ---
-{block}
---- end original ---
-
-Sentence signals:
-{json.dumps(compact_signals, ensure_ascii=False, indent=2)}
-
-EXACT spans (must survive byte-for-byte):
-{json.dumps(exact, ensure_ascii=False)}
-
-HIGH-SURPRISE spans (preserve operational meaning):
-{json.dumps(high, ensure_ascii=False)}
-
-YAKE cue candidates (hints only; relations/negation outrank keywords):
-{json.dumps(keywords, ensure_ascii=False)}
-
-Rewrite only this block. Output JSON only.
-"""
+        if len(out) >= limit:
+            break
+    return out
 
 
-def parse_rewrite(text: str) -> str:
-    try:
-        obj = json_repair_loads(text)
-    except Exception as e:
-        raise ValueError(f"Could not parse rewrite JSON: {e}\n{text[:2000]}")
-    if not isinstance(obj, dict) or "text" not in obj:
-        raise ValueError(f"Rewrite JSON has no text field:\n{text[:2000]}")
-    value = obj["text"]
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        value = str(value)
-    return value
+def restore_protected(masked: str, chunks: list[ProtectedChunk]) -> str:
+    out = masked
+    for c in chunks:
+        out = out.replace(c.placeholder, c.text)
+    return out
 
 
-def trailing_newlines(text: str) -> str:
-    m = re.search(r"(\r?\n)+$", text)
-    return m.group(0) if m else ""
-
-
-def normalize_candidate(original: str, candidate: str) -> str:
-    """
-    Keep surrounding source separation stable. The model owns prose, not the
-    number of line breaks separating source blocks.
-    """
-    tail = trailing_newlines(original)
-    core = candidate.strip()
-    if not core:
-        return tail if tail and original.strip() == "" else ""
-    return core + tail
-
-
-def markdown_leader(text: str) -> str | None:
-    """
-    Return a structural prefix that a non-empty rewrite must preserve.
-    This catches an LLM accidentally turning a list item or blockquote into a
-    plain paragraph.
-    """
-    first = text.splitlines()[0] if text.splitlines() else ""
-    m = re.match(r"^(\s*(?:[-+*]|\d+[.)]|>)\s+)", first)
-    return m.group(1) if m else None
-
-
-def validate_candidate(
-    original: str,
-    candidate: str,
-    signals: list[SentenceSignal],
-) -> list[str]:
+def validate_masked(candidate: str, section: Section, exact: list[str]) -> list[str]:
     errors = []
-    for exact in collect_exact_spans(signals):
-        if exact not in candidate:
-            errors.append(f"missing EXACT span: {exact!r}")
-
-    if any(s.label == "KEEP" for s in signals) and not candidate.strip():
-        errors.append("candidate dropped a block containing KEEP material")
-
-    leader = markdown_leader(original)
-    if candidate.strip() and leader and not candidate.startswith(leader):
-        errors.append(
-            f"candidate changed Markdown structural prefix {leader!r}"
-        )
-
-    # Do not let a prose rewrite suddenly introduce a fenced code block.
-    if "```" in candidate or "~~~" in candidate:
-        errors.append("candidate introduced a fenced code block")
-
+    positions = []
+    for c in section.protected:
+        count = candidate.count(c.placeholder)
+        if count != 1:
+            errors.append(f"{c.placeholder} occurs {count} times")
+        else:
+            positions.append(candidate.index(c.placeholder))
+    if positions != sorted(positions):
+        errors.append("protected placeholders reordered")
+    for x in exact:
+        if x not in candidate:
+            errors.append(f"missing exact literal {x!r}")
+    # No new placeholders.
+    allowed = {c.placeholder for c in section.protected}
+    for ph in PLACEHOLDER_RE.findall(candidate):
+        if ph not in allowed:
+            errors.append(f"invented placeholder {ph}")
     return errors
 
 
-def atomic_write(path: Path, text: str) -> None:
+def parse_json_text(raw: str) -> str:
+    obj = json_repair_loads(raw)
+    if not isinstance(obj, dict) or "text" not in obj:
+        raise ValueError("model response missing JSON text field")
+    return str(obj["text"] or "")
+
+
+def rewrite_section(
+    llm: Llama,
+    section: Section,
+    samples: list[Sample],
+    compiled_prefix: str,
+    *,
+    reduce_percent: float,
+    tolerance: float,
+    retries: int,
+    context_chars: int,
+    rewrite_slot: int | None,
+) -> tuple[str, dict[str, Any]]:
+    exact = exact_spans(mutable_text(section.masked))
+    orig_mutable = token_count(llm, mutable_text(section.masked))
+    target = max(1, round(orig_mutable * (1.0 - reduce_percent / 100.0))) if orig_mutable else 0
+
+    # Nothing mutable -> verbatim.
+    if orig_mutable == 0:
+        return section.raw, {
+            "original_mutable_tokens": 0,
+            "target_mutable_tokens": 0,
+            "compiled_mutable_tokens": 0,
+            "attempts": 0,
+            "validation_errors": [],
+        }
+
+    priorities = priority_excerpts(section, samples)
+    prior = compiled_prefix[-context_chars:]
+    user = f"""Section title: {section.title}
+
+Hard budget:
+- original mutable prose: {orig_mutable} tokens
+- reduce by: {reduce_percent:.1f}%
+- OUTPUT mutable prose MUST be <= {target} tokens (protected placeholders do not count)
+
+Already-compiled context immediately before this section:
+--- context ---
+{prior}
+--- end context ---
+
+Masked original section. Protected material is represented by immutable placeholders:
+--- section ---
+{section.masked}
+--- end section ---
+
+Highest RELATIVE surprisal excerpts for this model (ranking hints, not mandatory verbatim text):
+{json.dumps(priorities, ensure_ascii=False, indent=2)}
+
+EXACT mutable literals that must survive byte-for-byte:
+{json.dumps(exact, ensure_ascii=False)}
+
+Compile the WHOLE SECTION to the hard budget. Merge duplicate rules and remove generic explanation aggressively. Return JSON only.
+"""
+
+    # First generation limit includes placeholder overhead + JSON overhead.
+    placeholder_tok = token_count(llm, "\n".join(c.placeholder for c in section.protected))
+    max_gen = max(128, target + placeholder_tok + 160)
+
+    candidates: list[tuple[int, str, list[str], int]] = []
+    raw = llm.generate(REWRITE_SYSTEM, user, max_tokens=max_gen, slot=rewrite_slot)
+
+    for attempt in range(retries + 1):
+        try:
+            cand = parse_json_text(raw).strip()
+        except Exception as e:
+            cand = ""
+            errors = [f"parse: {e}"]
+        else:
+            errors = validate_masked(cand, section, exact)
+
+        cand_mutable = token_count(llm, mutable_text(cand)) if cand else 0
+        if cand and not errors:
+            candidates.append((cand_mutable, cand, [], attempt + 1))
+            if cand_mutable <= math.ceil(target * (1.0 + tolerance)):
+                return restore_protected(cand, section.protected), {
+                    "original_mutable_tokens": orig_mutable,
+                    "target_mutable_tokens": target,
+                    "compiled_mutable_tokens": cand_mutable,
+                    "attempts": attempt + 1,
+                    "validation_errors": [],
+                    "priority_excerpts": priorities,
+                }
+
+        if attempt >= retries:
+            break
+
+        # Tighten the best valid candidate if available; otherwise retry original.
+        basis = min(candidates, key=lambda x: x[0])[1] if candidates else section.masked
+        tighten = f"""Hard mutable-prose budget: <= {target} tokens.
+Current mutable prose: {token_count(llm, mutable_text(basis))} tokens.
+
+Current masked section:
+--- section ---
+{basis}
+--- end section ---
+
+Immutable placeholders in order:
+{json.dumps([c.placeholder for c in section.protected])}
+
+EXACT literals:
+{json.dumps(exact, ensure_ascii=False)}
+
+Shorten further. Do not reconstruct deleted explanation. Return JSON only.
+"""
+        raw = llm.generate(TIGHTEN_SYSTEM, tighten, max_tokens=max_gen, slot=rewrite_slot)
+
+    if candidates:
+        best_n, best, _e, attempts = min(candidates, key=lambda x: x[0])
+        return restore_protected(best, section.protected), {
+            "original_mutable_tokens": orig_mutable,
+            "target_mutable_tokens": target,
+            "compiled_mutable_tokens": best_n,
+            "attempts": attempts,
+            "validation_errors": ["budget missed after retries"],
+            "priority_excerpts": priorities,
+        }
+
+    return section.raw, {
+        "original_mutable_tokens": orig_mutable,
+        "target_mutable_tokens": target,
+        "compiled_mutable_tokens": orig_mutable,
+        "attempts": retries + 1,
+        "validation_errors": ["no valid rewrite; kept original"],
+        "priority_excerpts": priorities,
+    }
+
+
+
+def ensure_markdown_section_separator(text: str) -> str:
+    """
+    Ensure the next Markdown section starts as a real block.
+
+    Rewriters may shorten prose, but they do not own inter-section whitespace.
+    This prevents output such as:
+
+        ... stop.## Next Section
+
+    Only NEWLINES are appended. Nothing is stripped, because the section may
+    end in immutable code/HTML/table content whose bytes must remain exact.
+    """
+    if not text:
+        return text
+    if text.endswith("\n\n"):
+        return text
+    if text.endswith("\n"):
+        return text + "\n"
+    return text + "\n\n"
+
+def atomic_write(path: Path, text: str):
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(
-        prefix=path.name + ".",
-        suffix=".tmp",
-        dir=str(path.parent),
-        text=True,
-    )
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent), text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
         os.replace(tmp, path)
+    except:
+        print(text)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -1021,8 +716,7 @@ def sha256_text(text: str) -> str:
 
 def infer_skill_name(path: Path, text: str) -> str:
     try:
-        post = frontmatter.loads(text)
-        name = post.metadata.get("name")
+        name = frontmatter.loads(text).metadata.get("name")
         if name:
             return str(name)
     except Exception:
@@ -1030,395 +724,151 @@ def infer_skill_name(path: Path, text: str) -> str:
     return path.parent.name if path.name.upper().startswith("SKILL") else path.stem
 
 
-def token_count(llm: Llama, text: str) -> int:
-    return len(llm.tokenize(text, add_special=False, pieces=False))
-
-
-def write_progress_output(
-    output_path: Path,
-    *,
-    compiled_prefix: str,
-    segments: list[Segment],
-    next_index: int,
-) -> None:
-    remainder = "".join(s.text for s in segments[next_index:])
-    atomic_write(output_path, compiled_prefix + remainder)
-
-
-def save_checkpoint(
-    path: Path,
-    *,
-    input_hash: str,
-    next_index: int,
-    compiled_prefix: str,
-    stats: list[dict[str, Any]],
-    profile: dict[str, Any],
-) -> None:
-    atomic_write(path, json.dumps({
-        "input_hash": input_hash,
-        "next_index": next_index,
-        "compiled_prefix": compiled_prefix,
-        "stats": stats,
-        "profile": profile,
-    }, ensure_ascii=False, indent=2))
-
-
-def load_checkpoint(path: Path, input_hash: str) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("input_hash") != input_hash:
-        raise RuntimeError(
-            f"Checkpoint {path} belongs to a different input file."
-        )
-    return data
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Compile a long Markdown coding-agent skill against a llama.cpp model prior."
-    )
+def main():
+    ap = argparse.ArgumentParser(description="Section-budget, model-specific coding-agent skill compiler")
     ap.add_argument("skill", type=Path)
     ap.add_argument("--url", default="http://127.0.0.1:8080")
     ap.add_argument("--output", type=Path)
     ap.add_argument("--stats", type=Path)
-    ap.add_argument("--checkpoint", type=Path)
     ap.add_argument("--skill-name")
     ap.add_argument("--slot", type=int, default=0)
-    ap.add_argument(
-        "--rewrite-slot",
-        type=int,
-        default=None,
-        help="Optional second llama.cpp slot for rewrite generations.",
-    )
+    ap.add_argument("--rewrite-slot", type=int, default=None,
+                    help="Use another llama.cpp slot for rewriting if --parallel >= 2.")
+    ap.add_argument("--reduce-percent", type=float, default=50.0,
+                    help="Percent of MUTABLE PROSE to remove from every section. Default: 50.")
+    ap.add_argument("--section-level", type=int, default=2,
+                    help="Start a new compilation section at headings <= this level. Default: 2.")
+    ap.add_argument("--sample-stride", type=int, default=4,
+                    help="Score every Nth mutable token. Default: 4. 1 = exact/slow.")
     ap.add_argument("--top-n", type=int, default=128)
+    ap.add_argument("--budget-tolerance", type=float, default=0.08,
+                    help="Allow this fractional budget overflow before retrying. Default: .08")
+    ap.add_argument("--retries", type=int, default=2)
+    ap.add_argument("--rewrite-context-chars", type=int, default=4000)
     ap.add_argument("--no-cache", action="store_true")
-    ap.add_argument("--resume", action="store_true")
-
-    # Conservative initial thresholds. Calibrate against your model/skills.
-    ap.add_argument("--keep-p90", type=float, default=5.0)
-    ap.add_argument("--keep-max", type=float, default=8.0)
-    ap.add_argument("--keep-fraction", type=float, default=0.20)
-    ap.add_argument("--high-token", type=float, default=6.0)
-    ap.add_argument("--drop-p90", type=float, default=2.0)
-
-    ap.add_argument("--rewrite-context-chars", type=int, default=2500)
-    ap.add_argument("--rewrite-max-tokens", type=int, default=1024)
-    ap.add_argument("--language", default="en", help="YAKE language code.")
-    ap.add_argument(
-        "--system-prompt-file",
-        type=Path,
-        help="Override the canonical generic coding-agent system prompt.",
-    )
-    ap.add_argument(
-        "--max-prose-blocks",
-        type=int,
-        default=0,
-        help="Debug: stop after N prose blocks; 0 = all.",
-    )
+    ap.add_argument("--system-prompt-file", type=Path)
     args = ap.parse_args()
 
-    if args.top_n < 1:
-        ap.error("--top-n must be >= 1")
+    if not 0 <= args.reduce_percent < 100:
+        ap.error("--reduce-percent must be >=0 and <100")
+    if args.sample_stride < 1:
+        ap.error("--sample-stride must be >=1")
+    if args.section_level < 1 or args.section_level > 6:
+        ap.error("--section-level must be 1..6")
 
-    skill_path = args.skill.resolve()
-    original = skill_path.read_text(encoding="utf-8")
-    input_hash = sha256_text(original)
-
-    output = args.output or skill_path.with_name(skill_path.stem + ".compiled.md")
+    src_path = args.skill.resolve()
+    original = src_path.read_text(encoding="utf-8")
+    output = args.output or src_path.with_name(src_path.stem + ".compiled.md")
     stats_path = args.stats or output.with_suffix(output.suffix + ".stats.json")
-    checkpoint_path = args.checkpoint or output.with_suffix(output.suffix + ".checkpoint.json")
+    system = args.system_prompt_file.read_text(encoding="utf-8") if args.system_prompt_file else GENERIC_AGENT_SYSTEM
+    skill_name = args.skill_name or infer_skill_name(src_path, original)
 
-    system_prompt = (
-        args.system_prompt_file.read_text(encoding="utf-8")
-        if args.system_prompt_file
-        else GENERIC_AGENT_SYSTEM
-    )
-    skill_name = args.skill_name or infer_skill_name(skill_path, original)
-
-    llm = Llama(args.url, slot=args.slot)
+    llm = Llama(args.url, args.slot)
     props = llm.get("/props")
+    sections = parse_sections(original, args.section_level)
+    rendered_prefix = build_skill_prompt_prefix(llm, system, skill_name)
 
     console.print(f"[bold]model[/bold]: {props.get('model_path', '?')}")
-    console.print(f"[bold]build[/bold]: {props.get('build_info', '?')}")
     console.print(f"[bold]skill[/bold]: {skill_name}")
+    console.print(f"sections={len(sections)} reduce={args.reduce_percent:.1f}% sample_stride={args.sample_stride}")
+    if args.rewrite_slot is None:
+        console.print("[yellow]note:[/yellow] scorer and rewriter share one slot; --parallel 2 + --rewrite-slot 1 preserves more scorer cache.")
 
-    segments = markdown_segments(original)
-    prose_count = sum(s.kind == "prose" for s in segments)
-    protected_chars = sum(len(s.text) for s in segments if s.kind == "protected")
-    console.print(
-        f"segments={len(segments)} prose={prose_count} "
-        f"protected_chars={protected_chars:,}/{len(original):,}"
-    )
+    compiled = ""
+    report_sections = []
 
-    rendered_prefix = build_skill_prompt_prefix(
-        llm,
-        system_prompt=system_prompt,
-        skill_name=skill_name,
-    )
-
-    profile = {
-        "model_path": props.get("model_path"),
-        "build_info": props.get("build_info"),
-        "server": llm.url,
-        "skill_name": skill_name,
-        "system_prompt": system_prompt,
-        "skill_user_prefix": SKILL_USER_PREFIX,
-        "top_n": args.top_n,
-        "cache_prompt": not args.no_cache,
-        "thresholds": {
-            "keep_p90": args.keep_p90,
-            "keep_max": args.keep_max,
-            "keep_fraction": args.keep_fraction,
-            "high_token": args.high_token,
-            "drop_p90": args.drop_p90,
-        },
-    }
-
-    compiled_prefix = ""
-    stats: list[dict[str, Any]] = []
-    start_index = 0
-
-    if args.resume:
-        cp = load_checkpoint(checkpoint_path, input_hash)
-        if cp:
-            start_index = int(cp["next_index"])
-            compiled_prefix = str(cp["compiled_prefix"])
-            stats = list(cp.get("stats", []))
-            console.print(
-                f"[yellow]resuming[/yellow] at segment {start_index}/{len(segments)}"
-            )
-
-    # Always create a complete output immediately.
-    write_progress_output(
-        output,
-        compiled_prefix=compiled_prefix,
-        segments=segments,
-        next_index=start_index,
-    )
-
-    processed_prose = 0
-
-    for idx in range(start_index, len(segments)):
-        seg = segments[idx]
-
-        if seg.kind != "prose" or not seg.text.strip():
-            compiled_prefix += seg.text
-            stats.append({
-                "segment": idx,
-                "kind": seg.kind,
-                "lines": [seg.start_line + 1, seg.end_line],
-                "action": "verbatim",
-                "reason": seg.reason,
-                "original_chars": len(seg.text),
-                "compiled_chars": len(seg.text),
-            })
+    for sec in sections:
+        # Sections with no mutable text are exact passthrough and need no scoring/generation.
+        orig_mutable = token_count(llm, mutable_text(sec.masked))
+        if orig_mutable == 0:
+            compiled_sec = sec.raw
+            info = {
+                "original_mutable_tokens": 0,
+                "target_mutable_tokens": 0,
+                "compiled_mutable_tokens": 0,
+                "attempts": 0,
+                "validation_errors": [],
+                "priority_excerpts": [],
+            }
+            samples = []
         else:
-            processed_prose += 1
-            if args.max_prose_blocks and processed_prose > args.max_prose_blocks:
-                console.print("[yellow]debug prose-block limit reached[/yellow]")
-                write_progress_output(
-                    output,
-                    compiled_prefix=compiled_prefix,
-                    segments=segments,
-                    next_index=idx,
-                )
-                save_checkpoint(
-                    checkpoint_path,
-                    input_hash=input_hash,
-                    next_index=idx,
-                    compiled_prefix=compiled_prefix,
-                    stats=stats,
-                    profile=profile,
-                )
-                break
-
-            # IMPORTANT: context contains the already-compiled skill prefix.
-            context = rendered_prefix + compiled_prefix
-
-            token_scores, skipped = score_block(
-                llm,
-                context=context,
-                block=seg.text,
+            context = rendered_prefix + compiled
+            samples = sparse_score_section(
+                llm, context, sec,
                 top_n=args.top_n,
+                stride=args.sample_stride,
                 cache_prompt=not args.no_cache,
             )
-
-            signals = classify_sentences(
-                seg.text,
-                token_scores,
-                keep_p90=args.keep_p90,
-                keep_max=args.keep_max,
-                keep_fraction_threshold=args.keep_fraction,
-                high_token_threshold=args.high_token,
-                drop_p90=args.drop_p90,
+            compiled_sec, info = rewrite_section(
+                llm, sec, samples, compiled,
+                reduce_percent=args.reduce_percent,
+                tolerance=args.budget_tolerance,
+                retries=args.retries,
+                context_chars=args.rewrite_context_chars,
+                rewrite_slot=args.rewrite_slot,
             )
 
-            low_text = " ".join(
-                s.text for s in signals if s.label != "KEEP"
-            )
-            keywords = yake_keywords(low_text, args.language)
+        # Inter-section whitespace is compiler-owned, not model-owned.
+        compiled_sec = ensure_markdown_section_separator(compiled_sec)
+        compiled += compiled_sec
 
-            prior = compiled_prefix[-args.rewrite_context_chars:]
-            rp = rewrite_prompt(
-                block=seg.text,
-                signals=signals,
-                prior_context=prior,
-                keywords=keywords,
-            )
+        # Proper outfile after every section: compiled prefix + untouched remainder.
+        remainder = "".join(s.raw for s in sections[sec.index + 1:])
+        atomic_write(output, compiled + remainder)
 
-            raw = llm.generate_chat(
-                REWRITE_SYSTEM,
-                rp,
-                max_tokens=args.rewrite_max_tokens,
-                slot=args.rewrite_slot,
-            )
+        total_orig = token_count(llm, sec.raw)
+        total_new = token_count(llm, compiled_sec)
+        report_sections.append({
+            "section": sec.index,
+            "title": sec.title,
+            "lines": [sec.start_line + 1, sec.end_line],
+            "original_total_tokens": total_orig,
+            "compiled_total_tokens": total_new,
+            "saved_total_tokens": total_orig - total_new,
+            "sample_count": len(samples),
+            "sample_stride": args.sample_stride,
+            **info,
+        })
 
-            action = "rewrite"
-            errors: list[str] = []
-            try:
-                candidate = parse_rewrite(raw)
-                candidate = normalize_candidate(seg.text, candidate)
-                errors = validate_candidate(seg.text, candidate, signals)
-            except Exception as e:
-                candidate = seg.text
-                errors = [f"rewrite parse failure: {e}"]
-
-            original_tokens = token_count(llm, seg.text)
-            candidate_tokens = token_count(llm, candidate) if candidate else 0
-
-            # Compression must actually compress. An equal/larger rewrite adds
-            # model-authored risk for no context benefit.
-            if candidate_tokens >= original_tokens and candidate != seg.text:
-                errors.append(
-                    f"rewrite did not shrink block ({candidate_tokens} >= {original_tokens} tokens)"
-                )
-
-            if errors:
-                candidate = seg.text
-                candidate_tokens = original_tokens
-                action = "kept_original_after_validation"
-            elif not candidate.strip():
-                action = "dropped"
-            elif candidate == seg.text:
-                action = "unchanged"
-
-            compiled_prefix += candidate
-
-            mean_regret = (
-                statistics.fmean(s.regret_bits for s in token_scores)
-                if token_scores else 0.0
-            )
-            p90_regret = percentile(
-                [s.regret_bits for s in token_scores], 0.90
-            ) if token_scores else 0.0
-            top1_fraction = (
-                sum(s.rank == 1 for s in token_scores) / len(token_scores)
-                if token_scores else 0.0
-            )
-
-            stats.append({
-                "segment": idx,
-                "kind": "prose",
-                "lines": [seg.start_line + 1, seg.end_line],
-                "action": action,
-                "original_chars": len(seg.text),
-                "compiled_chars": len(candidate),
-                "original_tokens": original_tokens,
-                "compiled_tokens": candidate_tokens,
-                "mean_regret_bits": mean_regret,
-                "p90_regret_bits": p90_regret,
-                "top1_fraction": top1_fraction,
-                "boundary_bytes_unscored": skipped,
-                "keywords": keywords,
-                "validation_errors": errors,
-                "sentences": [asdict(s) for s in signals],
-                "original": seg.text,
-                "compiled": candidate,
-            })
-
-            saved = original_tokens - candidate_tokens
-            label_counts = {
-                k: sum(s.label == k for s in signals)
-                for k in ("KEEP", "CONDENSE", "DROP_CANDIDATE")
-            }
-            console.print(
-                f"[cyan]{idx+1}/{len(segments)}[/cyan] "
-                f"lines {seg.start_line+1}-{seg.end_line} "
-                f"{original_tokens}->{candidate_tokens} tok "
-                f"saved={saved:+d} "
-                f"p90={p90_regret:.2f} "
-                f"K/C/D={label_counts['KEEP']}/{label_counts['CONDENSE']}/{label_counts['DROP_CANDIDATE']} "
-                f"[bold]{action}[/bold]"
-            )
-            if errors:
-                for e in errors:
-                    console.print(f"  [red]reject:[/red] {e}")
-
-        # Proper output after EVERY segment:
-        # compiled prefix + untouched original remainder.
-        write_progress_output(
-            output,
-            compiled_prefix=compiled_prefix,
-            segments=segments,
-            next_index=idx + 1,
-        )
-        save_checkpoint(
-            checkpoint_path,
-            input_hash=input_hash,
-            next_index=idx + 1,
-            compiled_prefix=compiled_prefix,
-            stats=stats,
-            profile=profile,
+        target = info["target_mutable_tokens"]
+        got = info["compiled_mutable_tokens"]
+        status = "ok" if target == 0 or got <= math.ceil(target * (1 + args.budget_tolerance)) else "over"
+        console.print(
+            f"[{sec.index+1:>2}/{len(sections)}] {sec.title[:42]:42} "
+            f"mutable {info['original_mutable_tokens']}->{got} target={target} "
+            f"total {total_orig}->{total_new} samples={len(samples)} [{status}]"
         )
 
-    else:
-        # Finished.
-        final_text = compiled_prefix
-        atomic_write(output, final_text)
+    atomic_write(output, compiled)
+    orig_tokens = token_count(llm, original)
+    new_tokens = token_count(llm, compiled)
+    report = {
+        "input": str(src_path),
+        "output": str(output),
+        "input_hash": sha256_text(original),
+        "model_path": props.get("model_path"),
+        "build_info": props.get("build_info"),
+        "skill_name": skill_name,
+        "reduce_percent_mutable_prose": args.reduce_percent,
+        "section_level": args.section_level,
+        "sample_stride": args.sample_stride,
+        "original_tokens": orig_tokens,
+        "compiled_tokens": new_tokens,
+        "saved_tokens": orig_tokens - new_tokens,
+        "remaining_percent": 100.0 * new_tokens / orig_tokens if orig_tokens else 100.0,
+        "sections": report_sections,
+    }
+    atomic_write(stats_path, json.dumps(report, ensure_ascii=False, indent=2))
 
-        orig_tokens = token_count(llm, original)
-        final_tokens = token_count(llm, final_text)
-        report = {
-            "input": str(skill_path),
-            "output": str(output),
-            "input_hash": input_hash,
-            "profile": profile,
-            "original_tokens": orig_tokens,
-            "compiled_tokens": final_tokens,
-            "saved_tokens": orig_tokens - final_tokens,
-            "compression_ratio": (final_tokens / orig_tokens) if orig_tokens else 1.0,
-            "segments": stats,
-        }
-        atomic_write(
-            stats_path,
-            json.dumps(report, ensure_ascii=False, indent=2),
-        )
-
-        # Keep the checkpoint as a reproducibility artifact, but mark complete.
-        save_checkpoint(
-            checkpoint_path,
-            input_hash=input_hash,
-            next_index=len(segments),
-            compiled_prefix=compiled_prefix,
-            stats=stats,
-            profile=profile,
-        )
-
-        table = Table(title="Skill compilation complete")
-        table.add_column("Metric")
-        table.add_column("Value", justify="right")
-        table.add_row("Original tokens", f"{orig_tokens:,}")
-        table.add_row("Compiled tokens", f"{final_tokens:,}")
-        table.add_row("Saved", f"{orig_tokens-final_tokens:,}")
-        table.add_row(
-            "Remaining",
-            f"{(100*final_tokens/orig_tokens):.1f}%" if orig_tokens else "n/a",
-        )
-        console.print(table)
-        console.print(f"[bold green]Markdown:[/bold green] {output}")
-        console.print(f"[bold]Stats:[/bold] {stats_path}")
-        console.print(f"[bold]Checkpoint:[/bold] {checkpoint_path}")
+    t = Table(title="Skill compilation complete")
+    t.add_column("Metric"); t.add_column("Value", justify="right")
+    t.add_row("Original tokens", f"{orig_tokens:,}")
+    t.add_row("Compiled tokens", f"{new_tokens:,}")
+    t.add_row("Saved", f"{orig_tokens-new_tokens:,}")
+    t.add_row("Remaining", f"{100*new_tokens/orig_tokens:.1f}%" if orig_tokens else "n/a")
+    console.print(t)
+    console.print(f"[bold green]Markdown:[/bold green] {output}")
+    console.print(f"[bold]Stats:[/bold] {stats_path}")
 
 
 if __name__ == "__main__":

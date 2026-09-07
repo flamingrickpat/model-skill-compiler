@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "model-skill-compiler"
-version = "0.1.0"
+version = "0.2.0"
 description = "Model-specific progressive compression of coding-agent Markdown skills via llama.cpp."
 requires-python = ">=3.11"
 dependencies = [

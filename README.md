@@ -54,8 +54,7 @@ pip install -e .
 ## Run
 
 ```powershell
-python .\skill_compiler.py .\agents\skills\foo\SKILL.md `
-  --url http://127.0.0.1:8080
+python .\skill_compiler.py ...\quick-help\SKILL.md --url http://127.0.0.1:8080 --reduce-percent 50
 ```
 
 Default artifacts beside the input:
@@ -63,50 +62,3 @@ Default artifacts beside the input:
 - `SKILL.compiled.md` — the actual compiled skill
 - `SKILL.compiled.md.stats.json` — detailed score/rewrite diagnostics
 - `SKILL.compiled.md.checkpoint.json` — resume state
-
-The Markdown output is rewritten after every block as:
-
-`compiled prefix + untouched original remainder`
-
-so an interrupted run still leaves a complete usable skill.
-
-Resume:
-
-```powershell
-python .\skill_compiler.py .\agents\skills\foo\SKILL.md `
-  --url http://127.0.0.1:8080 `
-  --resume
-```
-
-## Important llama.cpp detail
-
-Scoring uses `n_predict=1` intentionally. Some builds return empty
-`top_logprobs` when `n_probs` is combined with multi-token generation.
-
-## Initial thresholds
-
-Defaults are deliberately conservative:
-
-- sentence `KEEP` if p90 regret >= 5 bits
-- or max regret >= 8 bits
-- or >=20% of tokens are >=6-bit regret
-- or it contains exact literals such as inline code/paths/numbers
-- sentence `DROP_CANDIDATE` only when p90 < 2 bits and it has no strong
-  semantic operator such as `never`, `only`, `before`, `unless`, etc.
-
-These are starting points, not universal constants. The statistics sidecar is
-intended for calibrating them against your own model and agent suite.
-
-## Libraries deliberately used
-
-- `markdown-it-py` + `mdit-py-plugins`: Markdown/source block structure
-- `BlingFire`: sentence segmentation
-- `YAKE`: low-information cue/keyphrase hints
-- `json-repair`: robust parsing of local-model rewrite JSON
-- `python-frontmatter`: role-name metadata
-- `requests`: llama.cpp native HTTP API
-- `rich`: progress/reporting
-
-The custom code is limited to the model-specific scoring/compiler logic,
-source-range preservation, and the special case of preserving a complete raw
-HTML document across CommonMark HTML-block splits.

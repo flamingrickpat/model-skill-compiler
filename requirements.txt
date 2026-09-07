@@ -3,6 +3,5 @@ rich
 markdown-it-py
 mdit-py-plugins
 blingfire
-yake
 json-repair
 python-frontmatter
